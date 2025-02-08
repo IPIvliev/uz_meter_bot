@@ -1,0 +1,10 @@
+config.py
+__pycache__/
+cache/
+logs/
+dist/
+build/
+
+*.spec
+*.DS_Store
+~$*
