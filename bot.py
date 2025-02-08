@@ -1,7 +1,7 @@
 import telebot
 import requests
 import json
-from telebot.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+from telebot.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton
 from ultralytics import YOLO
 
 # Инициализация бота
@@ -21,6 +21,32 @@ headers = {
 }
 # Хранилище временных данных (без базы данных)
 user_data = {}
+
+# Получаем данные пользователя из бд 1С
+def get_user_data(phone, headers, chat_id):
+    # Проверяем телефон в 1С
+    response = requests.get(f"{CHECK_PHONE_URL}{phone}", headers=headers)
+    if response.status_code == 200:
+        data = response.json()
+        if "List" in data and len(data["List"]) > 0:
+            user_data[chat_id]['account'] = data["List"]
+
+            if "counters" not in user_data[chat_id]:
+                user_data[chat_id]["counters"] = []
+            user_data[chat_id]["counters"] = user_data[chat_id]['account'][0]['Counters']
+
+            print(user_data[chat_id]["counters"])
+
+            # set_user_data(user_data, chat_id, data)
+            # print('user_data[chat_id] ', user_data[chat_id])
+            bot.send_message(chat_id, "Ваш номер телефона привязан к системе. Начнём сбор показаний.")
+            request_meter_readings(chat_id)
+        else:
+            bot.send_message(chat_id, "Ваш номер не найден в системе. Давайте привяжем его.")
+            request_ls_info(chat_id)
+    else:
+        print(response.text)
+        bot.send_message(chat_id, "Ошибка связи с сервером. Попробуйте позже.")
 
 # Команда /start
 @bot.message_handler(commands=["start"])
@@ -46,19 +72,7 @@ def handle_contact(message):
     user_data[chat_id] = {"phone": phone}
 
     # Проверяем телефон в 1С
-    response = requests.get(f"{CHECK_PHONE_URL}{phone}", headers=headers)
-    if response.status_code == 200:
-        data = response.json()
-        if "List" in data and len(data["List"]) > 0:
-            user_data[chat_id]["accounts"] = data["List"]
-            bot.send_message(chat_id, "Ваш номер телефона привязан к системе. Начнём сбор показаний.")
-            request_meter_readings(chat_id)
-        else:
-            bot.send_message(chat_id, "Ваш номер не найден в системе. Давайте привяжем его.")
-            request_ls_info(chat_id)
-    else:
-        print(response.text)
-        bot.send_message(chat_id, "Ошибка связи с сервером. Попробуйте позже.")
+    get_user_data(phone, headers, chat_id)
 
 # Запрос данных для привязки ЛС
 def request_ls_info(chat_id):
@@ -94,6 +108,7 @@ def process_apartment_number(message):
         result = response.json()
         if result.get("result") == "success":
             bot.send_message(chat_id, "Номер телефона успешно привязан! Теперь можно вводить показания.")
+            get_user_data(user_data[chat_id]["phone"], headers, chat_id)
             request_meter_readings(chat_id)
         else:
             bot.send_message(chat_id, "Ошибка привязки: " + result.get("INFO", "Попробуйте ещё раз."))
@@ -104,63 +119,163 @@ def process_apartment_number(message):
 
 # Запрос показаний счётчиков
 def request_meter_readings(chat_id):
-    bot.send_message(chat_id, "Отправьте фото счётчика или введите показания вручную.")
+    """Запрашивает у пользователя показания по каждому счётчику"""
+    counters = user_data[chat_id].get("counters", [])
+
+    if not counters:
+        bot.send_message(chat_id, "Ошибка: не найдено ни одного счётчика.")
+        return
+
+    user_data[chat_id]["current_counter_index"] = 0  # Начинаем с первого счётчика
+    ask_for_next_reading(chat_id)
+
+def ask_for_next_reading(chat_id):
+    """Запрашивает показания у пользователя для следующего счётчика"""
+    index = user_data[chat_id].get("current_counter_index", 0)
+    counters = user_data[chat_id]["counters"]
+
+    if index >= len(counters):
+        send_all_meters(chat_id)  # Отправляем все показания в 1С
+        return
+
+    current_counter = counters[index]
+    factory_number = current_counter.get("device_number", "Неизвестный номер")
+
+    user_data[chat_id]["current_counter"] = current_counter  # Запоминаем текущий счётчик
+
+    # Клавиатура с вариантами
+    markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    markup.add(KeyboardButton("Ввести вручную"), KeyboardButton("Отправить фото"))
+
+    bot.send_message(
+        chat_id,
+        f"Введите показания для счётчика №{factory_number} или отправьте фото:",
+        reply_markup=markup,
+    )
+
+
+
+@bot.message_handler(func=lambda message: message.text in ["Ввести вручную", "Отправить фото"])
+def handle_meter_option(message):
+    """Обрабатывает выбор пользователя"""
+    chat_id = message.chat.id
+    option = message.text
+
+    if option == "Ввести вручную":
+        bot.send_message(chat_id, "Введите показания цифрами:", reply_markup=ReplyKeyboardRemove())
+        bot.register_next_step_handler(message, handle_manual_input)
+
+    elif option == "Отправить фото":
+        bot.send_message(chat_id, "Отправьте фото счётчика.", reply_markup=ReplyKeyboardRemove())
+        bot.register_next_step_handler(message, handle_photo)
+
+def extract_value_from_yolo(result):
+    return "123.45"  # Здесь должно быть извлечение числа из результата модели
 
 @bot.message_handler(content_types=["photo"])
 def handle_photo(message):
+    """Обрабатывает фото, распознаёт показания через YOLO"""
     chat_id = message.chat.id
-    file_id = message.photo[-1].file_id
-    file_info = bot.get_file(file_id)
+
+    if "current_counter" not in user_data[chat_id]:
+        bot.send_message(chat_id, "Ошибка: счётчик не найден.")
+        return
+
+    file_info = bot.get_file(message.photo[-1].file_id)
     file_path = file_info.file_path
     photo_url = f"https://api.telegram.org/file/bot{TOKEN}/{file_path}"
 
-    # Сохранение фото
-    file = requests.get(photo_url)
-    with open("meter.jpg", "wb") as f:
-        f.write(file.content)
+    # Загружаем фото
+    response = requests.get(photo_url, stream=True)
+    if response.status_code != 200:
+        bot.send_message(chat_id, "Ошибка при загрузке фото.")
+        return
 
-    # Распознавание YOLO
+    with open("meter.jpg", "wb") as f:
+        f.write(response.content)
+
+    # Распознаём показания через YOLO
     result = model("meter.jpg")
+
     if result:
         recognized_value = extract_value_from_yolo(result)
-        bot.send_message(chat_id, f"Распознано: {recognized_value}. Подтвердите или введите вручную.")
-        user_data[chat_id]["photo_link"] = photo_url
-        user_data[chat_id]["meter_value"] = recognized_value
+        user_data[chat_id]["current_photo"] = photo_url
+        user_data[chat_id]["current_value"] = recognized_value
+
+        markup = InlineKeyboardMarkup()
+        markup.add(
+            InlineKeyboardButton("✅ Подтвердить", callback_data="confirm_value"),
+            InlineKeyboardButton("✏️ Ввести вручную", callback_data="manual_input"),
+        )
+
+        bot.send_message(chat_id, f"Распознано: {recognized_value}. Подтвердите или введите вручную.", reply_markup=markup)
     else:
-        bot.send_message(chat_id, "Не удалось распознать показания. Введите вручную:")
+        bot.send_message(chat_id, "Не удалось распознать. Введите вручную:")
         bot.register_next_step_handler_by_chat_id(chat_id, handle_manual_input)
 
-def extract_value_from_yolo(result):
-    # Здесь логика извлечения текста из результата YOLO
-    return "123.45"  # Замените на реальную обработку
+@bot.callback_query_handler(func=lambda call: call.data in ["confirm_value", "manual_input"])
+def handle_confirmation(call):
+    chat_id = call.message.chat.id
+    if call.data == "confirm_value":
+        save_meter_reading(chat_id)
+    elif call.data == "manual_input":
+        bot.send_message(chat_id, "Введите показания вручную:")
+        bot.register_next_step_handler_by_chat_id(chat_id, handle_manual_input)
 
-@bot.message_handler(func=lambda message: message.text.isdigit())
+@bot.message_handler(func=lambda message: message.text.replace('.', '', 1).isdigit())
 def handle_manual_input(message):
     chat_id = message.chat.id
-    user_data[chat_id]["meter_value"] = message.text
-    send_meter_data(chat_id)
+    print('["ls_number"] ', user_data[chat_id]['account'][0]['ls_number'])
+    user_data[chat_id]["current_value"] = float(message.text)
+    ["current_counter"]
+    save_meter_reading(chat_id)
 
-# Отправка показаний в 1С
-def send_meter_data(chat_id):
-    data = [
-        {
-            "ls_number": user_data[chat_id]["ls_number"],
-            "date": "2024.10.30",
-            "Counters": [
-                {
-                    "factory_number": "12345678",
-                    "param": user_data[chat_id]["meter_value"],
-                    "photo_link": user_data.get(chat_id, {}).get("photo_link", ""),
-                }
-            ],
-        }
-    ]
-    response = requests.post(WRITE_PARAMS_URL, headers=headers, json=data)
+def save_meter_reading(chat_id):
+    # if "counters" not in user_data[chat_id]:
+    #     user_data[chat_id]["counters"] = []
+
+    factory_number = user_data[chat_id]["counters"][0].get("device_number", "Неизвестный номер")
+    print('factory_number ', factory_number)
+
+    user_data[chat_id]["counters"].append({
+        "factory_number": factory_number,
+        "param": user_data[chat_id]["current_value"],
+        "photo_link": user_data[chat_id].get("current_photo", ""),
+    })
+    ask_add_more_counters(chat_id)
+
+# Запрос на добавление ещё одного счётчика или завершение
+def ask_add_more_counters(chat_id):
+    markup = InlineKeyboardMarkup()
+    markup.add(
+        InlineKeyboardButton("➕ Отправить ещё один", callback_data="add_more"),
+        InlineKeyboardButton("✅ Завершить", callback_data="finish"),
+    )
+    bot.send_message(chat_id, "Что дальше?", reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data in ["add_more", "finish"])
+def handle_counter_options(call):
+    chat_id = call.message.chat.id
+    if call.data == "add_more":
+        bot.send_message(chat_id, "Отправьте фото следующего счётчика или введите данные вручную.")
+    elif call.data == "finish":
+        send_all_meters(chat_id)
+
+# Отправка всех показаний в 1С
+def send_all_meters(chat_id):
+    print('user_data[chat_id]["counters"] ', user_data[chat_id]["counters"])
+    data = [{
+        "ls_number": user_data[chat_id]['account'][0]['ls_number'],
+        "date": "2024.10.30",
+        "Counters": user_data[chat_id]["counters"]
+    }]
+    response = requests.post(WRITE_PARAMS_URL, json=data, headers=headers)
+    # print()
 
     if response.status_code == 200 and response.json().get("result") == "success":
-        bot.send_message(chat_id, "Показания успешно отправлены!")
+        bot.send_message(chat_id, "Все показания успешно отправлены!")
     else:
-        bot.send_message(chat_id, "Ошибка отправки. Попробуйте снова.")
+        bot.send_message(chat_id, response.json().get("ERROR"))
 
-# Запуск бота
+
 bot.polling(none_stop=True)
