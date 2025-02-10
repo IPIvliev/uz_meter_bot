@@ -2,16 +2,23 @@ import telebot
 import requests
 import json
 import time
+import logging
 from telebot.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton
 from ultralytics import YOLO
+from predict import extract_value_from_yolo
 
 # Инициализация бота
 from config import TOKEN
 bot = telebot.TeleBot(TOKEN)
 
-# Инициализация модели YOLO
-model = YOLO("meter.pt")  # Замените на путь к вашей обученной модели
-
+# Настройка логирования: уровень INFO, форматирование и запись в файл bot.log
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    filename="bot.log",
+    filemode="a",
+    encoding="utf-8"
+)
 # Базовые API-эндпоинты
 API_BASE = "http://virt41.vet.uz/UT2_FL/hs/telegram"
 CHECK_PHONE_URL = f"{API_BASE}/check_phone/"
@@ -25,20 +32,28 @@ user_data = {}
 def get_user_data(phone, headers, chat_id):
     """Получаем данные пользователя из 1С и запускаем сбор показаний"""
     response = requests.get(f"{CHECK_PHONE_URL}{phone}", headers=headers)
+    
     if response.status_code == 200:
         data = response.json()
+        print(f"Ответ сервера на попытку проверить привязку номера телефона к ЛС: {data}")
+        logging.info((f"Ответ сервера на попытку проверить привязку номера телефона к ЛС: {data}"))
+
         if "List" in data and len(data["List"]) > 0:
             user_data[chat_id]['account'] = data["List"]
             # Сохраняем список счётчиков, полученных из 1С
             user_data[chat_id]["counters"] = user_data[chat_id]['account'][0]['Counters']
-            print("Полученные счётчики:", user_data[chat_id]["counters"])
+            # print("Полученные счётчики:", user_data[chat_id]["counters"])
             bot.send_message(chat_id, "Ваш номер телефона привязан к системе. Начнём сбор показаний.")
             request_meter_readings(chat_id)
+        elif data.get("ERROR") == "Передан некорректный номер телефона":
+            logging.error((f"Некорректный номер телефона: {phone}"))
+            print(f"Некорректный номер телефона: {phone}")
+            bot.send_message(chat_id, "Передан некорректный номер телефона")
         else:
             bot.send_message(chat_id, "Ваш номер не найден в системе. Давайте привяжем его.")
             request_ls_info(chat_id)
     else:
-        print(response.text)
+        # print('error: ', data)
         bot.send_message(chat_id, "Ошибка связи с сервером. Попробуйте позже.")
 
 # При старте выводим кнопку "Передать показания"
@@ -100,6 +115,7 @@ def process_apartment_number(message):
         "apartment_number": user_data[chat_id]["apartment_number"],
     }
     response = requests.post(CHECK_LS_CONNECT_URL, json=data, headers=headers)
+    
     if response.status_code == 200:
         result = response.json()
         if result.get("result") == "success":
@@ -107,14 +123,15 @@ def process_apartment_number(message):
             get_user_data(user_data[chat_id]["phone"], headers, chat_id)
             request_meter_readings(chat_id)
         else:
-            bot.send_message(chat_id, "Ошибка привязки: " + result.get("INFO", "Попробуйте ещё раз."))
+            bot.send_message(chat_id, "Ошибка привязки: " + result.get("ERROR", "Попробуйте ещё раз."))
             request_ls_info(chat_id)
     else:
-        print(response.text)
+        result = response.json()
+        print(f"Ошибка сервера в функции process_apartment_number. Попробуйте позже: {result}")
         bot.send_message(chat_id, "Ошибка сервера. Попробуйте позже.")
 
 def request_meter_readings(chat_id):
-    """Инициализируем сбор показаний – устанавливаем индекс первого счётчика"""
+    """Инициализируем сбор показаний устанавливаем индекс первого счётчика"""
     counters = user_data[chat_id].get("counters", [])
     if not counters:
         bot.send_message(chat_id, "Ошибка: не найдено ни одного счётчика.")
@@ -145,61 +162,104 @@ def ask_for_meter_reading(chat_id):
 
 def process_meter_reading(message):
     chat_id = message.chat.id
-    # Если отправлено фото – обрабатываем через YOLO
+
     if message.content_type == "photo":
+        # Получаем информацию о фото и формируем URL для скачивания
         file_info = bot.get_file(message.photo[-1].file_id)
         file_path = file_info.file_path
         photo_url = f"https://api.telegram.org/file/bot{TOKEN}/{file_path}"
+
+        # Скачиваем фото
         response = requests.get(photo_url, stream=True)
         if response.status_code != 200:
             bot.send_message(chat_id, "Ошибка при загрузке фото. Пожалуйста, попробуйте ещё раз.")
             bot.register_next_step_handler_by_chat_id(chat_id, process_meter_reading)
             return
+
         with open("meter.jpg", "wb") as f:
             f.write(response.content)
-        result = model("meter.jpg")
-        if result:
-            recognized_value = extract_value_from_yolo(result)
-            try:
-                recognized_value = float(recognized_value)
-            except ValueError:
-                bot.send_message(chat_id, "Не удалось распознать число с фото. Пожалуйста, введите показание вручную.")
-                bot.register_next_step_handler_by_chat_id(chat_id, process_meter_reading)
-                return
-            user_data[chat_id]["current_value"] = recognized_value
-            bot.send_message(chat_id, f"Распознано показание: {recognized_value}")
-        else:
-            bot.send_message(chat_id, "Не удалось распознать фото. Попробуйте ещё раз.")
-            bot.register_next_step_handler_by_chat_id(chat_id, process_meter_reading)
+
+        # Используем функцию, которая обрабатывает фото: обнаруживает рамку, выравнивает и распознаёт цифры
+        recognized_value = extract_value_from_yolo("meter.jpg")
+        if recognized_value is None:
+            bot.send_message(chat_id, "Не удалось распознать цифры с фото. Пожалуйста, введите показание вручную.")
+            bot.register_next_step_handler_by_chat_id(chat_id, process_manual_correction)
             return
-    # Если отправлен текст – пытаемся преобразовать его в число
+
+        # Предлагаем пользователю подтвердить распознанное значение или исправить его вручную
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("Подтвердить", callback_data="confirm_value"))
+        markup.add(InlineKeyboardButton("Исправить", callback_data="manual_input"))
+        bot.send_message(
+            chat_id,
+            f"Распознано показание: {recognized_value}.\n\nЕсли всё верно, нажмите «Подтвердить».\nЕсли требуется исправить, нажмите «Исправить» и введите правильное значение.",
+            reply_markup=markup
+        )
+        user_data[chat_id]["current_value"] = recognized_value
+        user_data[chat_id]["current_photo"] = photo_url
+        return
+
     elif message.content_type == "text":
+        # Если пользователь вводит значение текстом (например, после исправления)
         text = message.text.strip().replace(',', '.')
         try:
             value = float(text)
             user_data[chat_id]["current_value"] = value
+            save_meter_reading(chat_id)
         except ValueError:
             bot.send_message(chat_id, "Пожалуйста, введите корректное числовое значение.")
             bot.register_next_step_handler_by_chat_id(chat_id, process_meter_reading)
             return
-    else:
-        bot.send_message(chat_id, "Пожалуйста, отправьте показание числом или фото.")
-        bot.register_next_step_handler_by_chat_id(chat_id, process_meter_reading)
-        return
 
-    # Сохраняем показание в текущем счётчике
+def save_meter_reading(chat_id):
+    """
+    Функция сохраняет текущее показание для текущего счётчика и
+    переходит к следующему счётчику для ввода показаний.
+    
+    Она использует данные, сохранённые в user_data:
+      - "current_value": текущее введённое или распознанное значение,
+      - "current_photo": (опционально) ссылка на фото, если показание получено с фото.
+    
+    После обновления данных счётчика функция увеличивает индекс и вызывает
+    функцию, которая запрашивает показание для следующего счётчика.
+    """
+    # Получаем индекс текущего счётчика
     index = user_data[chat_id]["current_counter_index"]
+    # Извлекаем текущий счётчик из данных пользователя
     current_counter = user_data[chat_id]["current_counter"]
+    
+    # Обновляем показание и фото (если имеется)
     current_counter["param"] = user_data[chat_id]["current_value"]
-    if message.content_type == "photo":
-        current_counter["photo_link"] = photo_url
-    else:
-        current_counter["photo_link"] = ""
+    current_counter["photo_link"] = user_data[chat_id].get("current_photo", "")
+    
+    # Сохраняем обновлённые данные для текущего счётчика
     user_data[chat_id]["counters"][index] = current_counter
-
+    
     # Переходим к следующему счётчику
     user_data[chat_id]["current_counter_index"] += 1
     ask_for_meter_reading(chat_id)
+
+@bot.callback_query_handler(func=lambda call: call.data in ["confirm_value", "manual_input"])
+def handle_confirmation(call):
+    chat_id = call.message.chat.id
+    bot.answer_callback_query(call.id)
+    if call.data == "confirm_value":
+        # Пользователь подтвердил распознанное значение
+        save_meter_reading(chat_id)
+    elif call.data == "manual_input":
+        # Пользователь хочет исправить значение вручную
+        bot.send_message(chat_id, "Введите корректное показание вручную:")
+        bot.register_next_step_handler_by_chat_id(chat_id, process_manual_correction)
+
+def process_manual_correction(message):
+    chat_id = message.chat.id
+    try:
+        value = float(message.text.strip().replace(',', '.'))
+        user_data[chat_id]["current_value"] = value
+        save_meter_reading(chat_id)
+    except ValueError:
+        bot.send_message(chat_id, "Введите корректное числовое значение.")
+        bot.register_next_step_handler_by_chat_id(chat_id, process_manual_correction)
 
 def finish_meter_readings(chat_id):
     """
@@ -255,7 +315,7 @@ def send_all_meters(chat_id):
     ]
     где factory_number – это значение device_number.
     """
-    print("Собранные показания:", user_data[chat_id]["counters"])
+    # print("Собранные показания:", user_data[chat_id]["counters"])
     transformed_counters = []
     for counter in user_data[chat_id]["counters"]:
         transformed_counters.append({
@@ -293,18 +353,18 @@ def restart_process_handler(call):
         markup.add(button)
         bot.send_message(chat_id, "Номер телефона не найден. Пожалуйста, отправьте ваш контакт.", reply_markup=markup)
 
-def extract_value_from_yolo(result):
-    # Здесь необходимо реализовать извлечение числа из результата модели.
-    # В этом примере возвращается тестовое значение.
-    return 'False'
+# def extract_value_from_yolo(result):
+#     # Здесь необходимо реализовать извлечение числа из результата модели.
+#     # В этом примере возвращается тестовое значение.
+#     return 'False'
 
-bot.polling(none_stop=True) # Для тестов
+# bot.polling(none_stop=True) # Для тестов
 
 # Включаем бота в продакшн
-# if __name__ == '__main__':
-#     while True:
-#         try:
-#             bot.polling(none_stop=True)
-#         except Exception as e:
-#             time.sleep(3)
-#             print(e)
+if __name__ == '__main__':
+    while True:
+        try:
+            bot.polling(none_stop=True)
+        except Exception as e:
+            time.sleep(3)
+            print(e)
