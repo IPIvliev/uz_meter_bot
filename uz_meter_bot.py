@@ -5,7 +5,7 @@ import time
 import logging
 from telebot.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton
 from ultralytics import YOLO
-from predict import extract_value_from_yolo
+from predict import extract_value_from_roboflow
 
 # Инициализация бота
 from config import TOKEN
@@ -62,7 +62,17 @@ def start(message):
     chat_id = message.chat.id
     markup = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
     markup.add("Передать показания")
-    bot.send_message(chat_id, "Здравствуйте! Для передачи показаний нажмите кнопку 'Передать показания'.", reply_markup=markup)
+    text = "Мы рады приветствовать вас! \n\nЭтот чат-бот создан для упрощения процесса передачи показаний счетчиков горячей воды.\n\n" \
+    "С его помощью вы можете: \n\n" \
+    "* Авторизоваться с помощью номера телефона для безопасного доступа к своим лицевым счетам.\n" \
+    "* Выбрать лицевой счет и связанный с ним счетчик для передачи показаний.\n" \
+    "* Загрузить фото показаний счетчика, и бот автоматически распознает данные.\n" \
+    "* Подтвердить показания перед отправкой, чтобы избежать ошибок.\n" \
+    "* Получать уведомления о состоянии вашего счета и напоминания о необходимости передать показания.\n\n" \
+    "Наш бот помогает сэкономить время и упростить взаимодействие с коммунальными службами.\n\n" \
+    "Спасибо, что выбрали наш сервис!"
+    
+    bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=markup)
 
 # Если пользователь нажимает кнопку "Передать показания"
 @bot.message_handler(func=lambda message: message.text == "Передать показания")
@@ -134,12 +144,13 @@ def request_meter_readings(chat_id):
     """Инициализируем сбор показаний устанавливаем индекс первого счётчика"""
     counters = user_data[chat_id].get("counters", [])
     if not counters:
-        bot.send_message(chat_id, "Ошибка: не найдено ни одного счётчика.")
+        bot.send_message(chat_id, "Ошибка: не найдено ни одного счётчика.", reply_markup=None)
         return
     user_data[chat_id]["current_counter_index"] = 0
     ask_for_meter_reading(chat_id)
 
 def ask_for_meter_reading(chat_id):
+    
     """
     Запрашиваем показание для текущего счётчика.
     Пользователь может отправить либо число (текстом), либо фото.
@@ -156,8 +167,9 @@ def ask_for_meter_reading(chat_id):
         chat_id,
         f"Введите показание для счётчика №{current_counter.get('device_number', 'Неизвестный номер')}.\n"
         f"Предыдущие показания счётчика были: {current_counter.get('last_param', '0.00')}.\n"
-        "Вы можете отправить число или фотографию счётчика."
+        "Вы можете отправить число или фотографию счётчика.", reply_markup=ReplyKeyboardRemove()
     )
+
     bot.register_next_step_handler_by_chat_id(chat_id, process_meter_reading)
 
 def process_meter_reading(message):
@@ -180,7 +192,9 @@ def process_meter_reading(message):
             f.write(response.content)
 
         # Используем функцию, которая обрабатывает фото: обнаруживает рамку, выравнивает и распознаёт цифры
-        recognized_value = extract_value_from_yolo("meter.jpg")
+        # print('user phone: ', user_data[chat_id]['phone'])
+
+        recognized_value = extract_value_from_roboflow("meter.jpg", user_data[chat_id]['phone'])
         if recognized_value is None:
             bot.send_message(chat_id, "Не удалось распознать цифры с фото. Пожалуйста, введите показание вручную.")
             bot.register_next_step_handler_by_chat_id(chat_id, process_manual_correction)
@@ -358,13 +372,13 @@ def restart_process_handler(call):
 #     # В этом примере возвращается тестовое значение.
 #     return 'False'
 
-# bot.polling(none_stop=True) # Для тестов
+bot.polling(none_stop=True) # Для тестов
 
 # Включаем бота в продакшн
-if __name__ == '__main__':
-    while True:
-        try:
-            bot.polling(none_stop=True)
-        except Exception as e:
-            time.sleep(3)
-            print(e)
+# if __name__ == '__main__':
+#     while True:
+#         try:
+#             bot.polling(none_stop=True)
+#         except Exception as e:
+#             time.sleep(3)
+#             print(e)
